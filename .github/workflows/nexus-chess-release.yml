@@ -92,6 +92,14 @@ jobs:
             echo 'The Linux preset must use Godot platform identifier Linux.'
             exit 1
           fi
+          if ! grep -Fqx 'textures/vram_compression/import_etc2_astc=true' project.godot; then
+            echo 'Apple Silicon exports require ETC2/ASTC texture imports.'
+            exit 1
+          fi
+          if ! awk '/name="macOS"/,/^\[preset\.3\]/' export_presets.cfg | grep -Fqx 'texture_format/etc2_astc=true'; then
+            echo 'The universal macOS preset must include ETC2/ASTC textures.'
+            exit 1
+          fi
           resource_filter_count=$(grep -Fc 'export_filter="resources"' export_presets.cfg)
           if [ "$resource_filter_count" -ne 5 ]; then
             echo 'Every Godot preset must use the explicit Nexus Chess resource allowlist.'
