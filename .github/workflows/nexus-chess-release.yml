@@ -1,0 +1,343 @@
+name: Build Nexus Chess
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-chess-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.4"
+  GODOT_VERSION: "4.6.3"
+  JAVA_VERSION: "17"
+
+jobs:
+  preflight:
+    name: Source and test checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Reject runtime data and large binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='\.(litertlm|sqlite|sqlite3|db|key|p12|jks|keystore|mobileprovision)(-|$)|\.part$'
+          if git ls-files | grep -E "$forbidden"; then
+            echo "Runtime models, state, keys, and partial downloads must not be tracked."
+            exit 1
+          fi
+          too_large=0
+          while IFS= read -r -d '' file; do
+            bytes=$(stat -c '%s' "$file")
+            if [ "$bytes" -gt 99614720 ]; then
+              echo "Tracked file exceeds 95 MiB: $file ($bytes bytes)"
+              too_large=1
+            fi
+          done < <(git ls-files -z)
+          test "$too_large" -eq 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Fetch backend dependencies
+        working-directory: chess_llm_backend
+        run: flutter pub get
+
+      - name: Analyze Dart
+        working-directory: chess_llm_backend
+        run: flutter analyze --no-pub
+
+      - name: Run backend tests
+        working-directory: chess_llm_backend
+        run: flutter test --no-pub
+
+  godot_exports:
+    name: Godot desktop and Android exports
+    runs-on: ubuntu-24.04
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Export Linux, Windows, and macOS game shells
+        uses: firebelley/godot-export@v7.0.0
+        with:
+          godot_executable_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
+          godot_export_templates_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz
+          relative_project_path: ./
+          presets_to_export: Linux,Windows,macOS
+          use_preset_export_path: true
+          cache: true
+          verbose: true
+
+      - name: Export Android game shell
+        uses: firebelley/godot-export@v7.0.0
+        with:
+          godot_executable_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
+          godot_export_templates_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz
+          relative_project_path: ./
+          presets_to_export: Android
+          use_preset_export_path: true
+          export_debug: true
+          cache: true
+          verbose: true
+
+      - name: Verify exports contain no runtime data
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find dist/godot -type f \( -name '*.litertlm' -o -name '*.sqlite*' -o -name '*.db*' -o -name '*.key' -o -name '*.part' \) -print -quit | grep -q .; then
+            echo "A runtime model, database, key, or partial file entered a Godot export."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-Godot-Exports
+          path: dist/godot
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux x64 package
+    runs-on: ubuntu-24.04
+    needs: [preflight, godot_exports]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Linux build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev libjsoncpp-dev liblzma-dev libstdc++-12-dev
+
+      - name: Build Flutter backend
+        working-directory: chess_llm_backend
+        run: |
+          flutter pub get
+          flutter build linux --release --no-pub
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nexus-Chess-Godot-Exports
+          path: dist/godot
+
+      - name: Assemble Linux application
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package/linux/backend
+          cp -a dist/godot/linux/. dist/package/linux/
+          cp -a chess_llm_backend/build/linux/x64/release/bundle/. dist/package/linux/backend/
+          chmod +x dist/package/linux/NexusChess.x86_64 dist/package/linux/backend/nexus_chess_llm
+          tar -C dist/package/linux -czf dist/Nexus-Chess-Linux-x64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-Linux-x64
+          path: dist/Nexus-Chess-Linux-x64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 package
+    runs-on: windows-2025
+    needs: [preflight, godot_exports]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Create Windows runner and build backend
+        working-directory: chess_llm_backend
+        shell: pwsh
+        run: |
+          flutter create --platforms=windows --org com.nexus.chess --project-name nexus_chess_llm .
+          flutter pub get
+          flutter build windows --release --no-pub
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nexus-Chess-Godot-Exports
+          path: dist/godot
+
+      - name: Assemble Windows application
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package/windows/backend | Out-Null
+          Copy-Item dist/godot/windows/* dist/package/windows/ -Recurse -Force
+          Copy-Item chess_llm_backend/build/windows/x64/runner/Release/* dist/package/windows/backend/ -Recurse -Force
+          Compress-Archive -Path dist/package/windows/* -DestinationPath dist/Nexus-Chess-Windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-Windows-x64
+          path: dist/Nexus-Chess-Windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal package
+    runs-on: macos-15
+    needs: [preflight, godot_exports]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Create macOS runner and build backend
+        working-directory: chess_llm_backend
+        run: |
+          flutter create --platforms=macos --org com.nexus.chess --project-name nexus_chess_llm .
+          flutter pub get
+          flutter build macos --release --no-pub
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nexus-Chess-Godot-Exports
+          path: dist/godot
+
+      - name: Assemble macOS application
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package/macos
+          ditto -x -k dist/godot/macos/NexusChess.zip dist/package/macos
+          game_app=$(find dist/package/macos -maxdepth 1 -name '*.app' -print -quit)
+          backend_app=$(find chess_llm_backend/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$game_app"
+          test -n "$backend_app"
+          mkdir -p "$game_app/Contents/Helpers"
+          ditto "$backend_app" "$game_app/Contents/Helpers/NexusChessBackend.app"
+          codesign --force --deep --sign - "$game_app/Contents/Helpers/NexusChessBackend.app"
+          codesign --force --deep --sign - "$game_app"
+          ditto -c -k --sequesterRsrc --keepParent "$game_app" dist/Nexus-Chess-macOS-universal.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-macOS-universal
+          path: dist/Nexus-Chess-macOS-universal.zip
+          if-no-files-found: error
+
+  android:
+    name: Android game and model host
+    runs-on: ubuntu-24.04
+    needs: [preflight, godot_exports]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Create Android runner and build model host
+        working-directory: chess_llm_backend
+        run: |
+          flutter create --platforms=android --org com.nexus.chess --project-name nexus_chess_llm .
+          if ! grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml; then
+            sed -i '/<manifest/a\    <uses-permission android:name="android.permission.INTERNET" />' android/app/src/main/AndroidManifest.xml
+          fi
+          flutter pub get
+          flutter build apk --release --no-pub
+          flutter build appbundle --release --no-pub
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nexus-Chess-Godot-Exports
+          path: dist/godot
+
+      - name: Collect Android artifacts
+        run: |
+          mkdir -p dist/android
+          cp dist/godot/android/NexusChess.apk dist/android/NexusChess-Godot.apk
+          cp chess_llm_backend/build/app/outputs/flutter-apk/app-release.apk dist/android/NexusChess-ModelHost.apk
+          cp chess_llm_backend/build/app/outputs/bundle/release/app-release.aab dist/android/NexusChess-ModelHost.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-Android
+          path: dist/android
+          if-no-files-found: error
+
+  ios:
+    name: iOS unsigned projects
+    runs-on: macos-15
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Create iOS runner and build unsigned model host
+        working-directory: chess_llm_backend
+        run: |
+          flutter create --platforms=ios --org com.nexus.chess --project-name nexus_chess_llm .
+          flutter pub get
+          flutter build ios --release --no-codesign --no-pub
+
+      - name: Install Godot and export iOS Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/godot.zip" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/templates.tpz" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          ditto -x -k "$RUNNER_TEMP/godot.zip" "$RUNNER_TEMP/godot"
+          mkdir -p "$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable"
+          ditto -x -k "$RUNNER_TEMP/templates.tpz" "$RUNNER_TEMP/templates"
+          cp -a "$RUNNER_TEMP/templates/templates/." "$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable/"
+          mkdir -p dist/godot/ios
+          "$RUNNER_TEMP/godot/Godot.app/Contents/MacOS/Godot" --headless --path . --export-debug iOS dist/godot/ios/NexusChess
+
+      - name: Package unsigned iOS artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios
+          ditto -c -k --sequesterRsrc --keepParent chess_llm_backend/build/ios/iphoneos/Runner.app dist/ios/NexusChess-ModelHost-unsigned.zip
+          ditto -c -k --sequesterRsrc --keepParent dist/godot/ios dist/ios/NexusChess-Godot-Xcode.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-Chess-iOS-unsigned
+          path: dist/ios
+          if-no-files-found: error
