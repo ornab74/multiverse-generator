@@ -78,8 +78,49 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
+      - name: Validate Godot export preset contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preset in Linux Windows macOS Android iOS; do
+            if ! grep -Fqx "name=\"${preset}\"" export_presets.cfg; then
+              echo "Missing Godot export preset: ${preset}"
+              exit 1
+            fi
+          done
+          if ! grep -Fqx 'platform="Linux"' export_presets.cfg; then
+            echo 'The Linux preset must use Godot platform identifier Linux.'
+            exit 1
+          fi
+          resource_filter_count=$(grep -Fc 'export_filter="resources"' export_presets.cfg)
+          if [ "$resource_filter_count" -ne 5 ]; then
+            echo 'Every Godot preset must use the explicit Nexus Chess resource allowlist.'
+            exit 1
+          fi
+          required_resources=(
+            res://node_3d.tscn
+            res://main.gd
+            res://front_end.gd
+            res://ui/llm_arena_panel.gd
+            res://systems/naza_dart_gemma_bridge.gd
+            res://systems/llm_game_agent.gd
+            res://systems/chess_history.gd
+            res://game_modules/chess_core.gd
+            res://game_modules/deterministic_game_module.gd
+            res://assets/fonts/InterVariable.ttf
+            res://assets/fonts/SpaceGroteskVariable.ttf
+            res://assets/fonts/JetBrainsMonoVariable.ttf
+          )
+          for resource in "${required_resources[@]}"; do
+            occurrence_count=$(grep -Fo "\"${resource}\"" export_presets.cfg | wc -l)
+            if [ "$occurrence_count" -ne 5 ]; then
+              echo "Every preset must include required resource: ${resource}"
+              exit 1
+            fi
+          done
+
       - name: Export Linux, Windows, and macOS game shells
-        uses: firebelley/godot-export@v7.0.0
+        uses: firebelley/godot-export@v8.0.0
         with:
           godot_executable_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
           godot_export_templates_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz
@@ -90,7 +131,7 @@ jobs:
           verbose: true
 
       - name: Export Android game shell
-        uses: firebelley/godot-export@v7.0.0
+        uses: firebelley/godot-export@v8.0.0
         with:
           godot_executable_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
           godot_export_templates_download_url: https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz
@@ -311,7 +352,15 @@ jobs:
       - name: Create iOS runner and build unsigned model host
         working-directory: chess_llm_backend
         run: |
+          set -euo pipefail
           flutter create --platforms=ios --org com.nexus.chess --project-name nexus_chess_llm .
+          xcode_project="ios/Runner.xcodeproj/project.pbxproj"
+          perl -0pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 16.0;/g' "$xcode_project"
+          deployment_target_count=$(grep -Fc 'IPHONEOS_DEPLOYMENT_TARGET = 16.0;' "$xcode_project")
+          if [ "$deployment_target_count" -lt 3 ]; then
+            echo "Expected every generated iOS build configuration to target iOS 16.0."
+            exit 1
+          fi
           flutter pub get
           flutter build ios --release --no-codesign --no-pub
 
