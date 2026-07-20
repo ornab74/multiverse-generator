@@ -54,6 +54,10 @@ void main() {
 
   group('pinned model identity', () {
     test('requires the exact known byte length', () {
+      expect(modelRepository, 'litert-community/gemma-4-E2B-it-litert-lm');
+      expect(modelRevision, hasLength(40));
+      expect(modelRevision, matches(RegExp(r'^[0-9a-f]{40}$')));
+      expect(modelUrl, contains('/resolve/$modelRevision/$modelName'));
       expect(modelByteLength, 2583085056);
       expect(hasExactModelByteLength(modelByteLength), isTrue);
       expect(hasExactModelByteLength(modelByteLength - 1), isFalse);
@@ -99,11 +103,21 @@ void main() {
         isTrue,
       );
       expect(
+        isAllowedModelUri(
+          Uri.parse('https://us.aws.cdn.hf.co/blob?token=signed'),
+        ),
+        isTrue,
+      );
+      expect(
         isAllowedModelUri(Uri.parse('http://huggingface.co/model')),
         isFalse,
       );
       expect(
         isAllowedModelUri(Uri.parse('https://evil-huggingface.co/model')),
+        isFalse,
+      );
+      expect(
+        isAllowedModelUri(Uri.parse('https://cdn.hf.co.evil.example/model')),
         isFalse,
       );
       expect(
@@ -118,6 +132,19 @@ void main() {
         isAllowedModelUri(Uri.parse('https://huggingface.co/model#fragment')),
         isFalse,
       );
+    });
+
+    test('accepts only canonical bounded Content-Range responses', () {
+      expect(parseContentRange('bytes 1048576-2583085055/2583085056'), (
+        start: 1048576,
+        end: 2583085055,
+        total: 2583085056,
+      ));
+      expect(parseContentRange('bytes */2583085056'), isNull);
+      expect(parseContentRange('bytes 9-8/10'), isNull);
+      expect(parseContentRange('bytes 0-10/10'), isNull);
+      expect(parseContentRange('items 0-9/10'), isNull);
+      expect(parseContentRange(null), isNull);
     });
   });
 

@@ -725,68 +725,204 @@ final class ChessGemmaRuntime {
 
   Future<void> _downloadPinnedModel(File target) async {
     final part = File('${target.path}.part');
-    if (await part.exists()) await part.delete();
-    final client = HttpClient()
-      ..autoUncompress = false
-      ..connectionTimeout = const Duration(seconds: 30);
-    IOSink? output;
-    try {
-      final response = await _openPinnedGet(client, Uri.parse(modelUrl));
-      final length = response.contentLength;
-      if (length >= 0 && !hasExactModelByteLength(length)) {
-        throw StateError(
-          'Pinned model response length mismatch. Expected $modelByteLength bytes, got $length.',
+    await _sanitizePartialDownload(part);
+
+    Object? lastFailure;
+    StackTrace? lastStack;
+    for (var attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await _downloadPinnedModelAttempt(part);
+        await _promoteVerifiedDownload(part, target);
+        return;
+      } on _PinnedModelIntegrityException {
+        if (await part.exists()) await part.delete();
+        rethrow;
+      } on StateError {
+        // URL-policy and redirect-policy failures are deterministic. Retrying
+        // them would only repeat a request that has already failed closed.
+        rethrow;
+      } catch (error, stack) {
+        lastFailure = error;
+        lastStack = stack;
+        if (attempt == 4) break;
+        final retained = await part.exists() ? await part.length() : 0;
+        _setDownloadProgress(
+          retained,
+          'connection paused; retrying verified source (${attempt + 1}/4)',
+        );
+        await Future<void>.delayed(Duration(seconds: 1 << attempt));
+      }
+    }
+    Error.throwWithStackTrace(lastFailure!, lastStack!);
+  }
+
+  Future<void> _sanitizePartialDownload(File part) async {
+    final type = await FileSystemEntity.type(part.path, followLinks: false);
+    if (type == FileSystemEntityType.notFound) return;
+    if (type != FileSystemEntityType.file) {
+      await part.delete(recursive: type == FileSystemEntityType.directory);
+      return;
+    }
+    if (await part.length() > modelByteLength) await part.delete();
+  }
+
+  Future<void> _downloadPinnedModelAttempt(File part) async {
+    var offset = await part.exists() ? await part.length() : 0;
+    if (offset == modelByteLength) {
+      final actual = await _sha256File(part, 5, 53);
+      if (actual != modelSha256) {
+        throw _PinnedModelIntegrityException(
+          'Saved model identity mismatch. Expected $modelSha256, got $actual.',
         );
       }
-      output = part.openWrite(mode: FileMode.writeOnly);
+      return;
+    }
+
+    final client = HttpClient()
+      ..autoUncompress = false
+      ..connectionTimeout = const Duration(seconds: 30)
+      ..idleTimeout = const Duration(seconds: 90);
+    RandomAccessFile? output;
+    try {
+      var response = await _openPinnedGet(
+        client,
+        Uri.parse(modelUrl),
+        offset: offset,
+      );
+
+      // Some gateways ignore Range. Restart cleanly instead of appending a
+      // complete response to a partial file.
+      if (offset > 0 && response.statusCode == HttpStatus.ok) {
+        await _cancelResponse(response);
+        await part.delete();
+        offset = 0;
+        response = await _openPinnedGet(client, Uri.parse(modelUrl), offset: 0);
+      }
+      _validateDownloadResponse(response, offset);
+
       final digestSink = _DigestSink();
       final digestInput = crypto.sha256.startChunkedConversion(digestSink);
-      var received = 0;
-      await for (final chunk in response) {
+      if (offset > 0) {
+        _setDownloadProgress(offset, 'checking saved download before resume');
+        await for (final chunk in part.openRead()) {
+          digestInput.add(chunk);
+        }
+      }
+
+      output = await part.open(
+        mode: offset > 0 ? FileMode.append : FileMode.write,
+      );
+      var received = offset;
+      await for (final chunk in response.timeout(const Duration(seconds: 90))) {
         received += chunk.length;
         if (received > modelByteLength) {
-          throw StateError(
-            'Pinned model download exceeded the exact $modelByteLength-byte size.',
+          throw const _PinnedModelIntegrityException(
+            'Pinned model download exceeded its exact byte length.',
           );
         }
-        output.add(chunk);
+        await output.writeFrom(chunk);
         digestInput.add(chunk);
-        if (length > 0) {
-          _setProgress(
-            (5 + (received / length * 48).floor()).clamp(5, 53),
-            'downloading and hashing pinned model',
-          );
-        }
+        _setDownloadProgress(received, 'downloading verified model');
       }
       await output.flush();
       await output.close();
       output = null;
       digestInput.close();
+
       if (!hasExactModelByteLength(received)) {
-        throw StateError(
-          'Pinned model download was truncated. Expected $modelByteLength bytes, got $received.',
+        throw HttpException(
+          'Pinned model transfer paused at $received of $modelByteLength bytes.',
+          uri: Uri.parse(modelUrl),
         );
       }
       final actual = digestSink.value?.toString().toLowerCase() ?? '';
       if (actual != modelSha256) {
-        throw StateError(
-          'Downloaded model SHA-256 mismatch. Expected $modelSha256, got $actual.',
+        throw _PinnedModelIntegrityException(
+          'Downloaded model identity mismatch. Expected $modelSha256, got $actual.',
         );
       }
-      if (await target.exists()) await target.delete();
-      await part.rename(target.path);
     } finally {
       try {
         await output?.close();
       } catch (_) {}
-      if (await part.exists()) await part.delete();
       client.close(force: true);
     }
+  }
+
+  void _validateDownloadResponse(HttpClientResponse response, int offset) {
+    if (offset == 0) {
+      if (response.statusCode != HttpStatus.ok) {
+        throw HttpException(
+          'Pinned model host returned HTTP ${response.statusCode}.',
+          uri: Uri.parse(modelUrl),
+        );
+      }
+      if (response.contentLength >= 0 &&
+          !hasExactModelByteLength(response.contentLength)) {
+        throw _PinnedModelIntegrityException(
+          'Pinned model response length mismatch. Expected $modelByteLength bytes, got ${response.contentLength}.',
+        );
+      }
+      return;
+    }
+
+    if (response.statusCode != HttpStatus.partialContent) {
+      throw HttpException(
+        'Pinned model resume returned HTTP ${response.statusCode}.',
+        uri: Uri.parse(modelUrl),
+      );
+    }
+    final range = parseContentRange(
+      response.headers.value(HttpHeaders.contentRangeHeader),
+    );
+    if (range == null ||
+        range.start != offset ||
+        range.end != modelByteLength - 1 ||
+        range.total != modelByteLength) {
+      throw const _PinnedModelIntegrityException(
+        'Pinned model resume returned an unexpected byte range.',
+      );
+    }
+    final remaining = modelByteLength - offset;
+    if (response.contentLength >= 0 && response.contentLength != remaining) {
+      throw _PinnedModelIntegrityException(
+        'Pinned model resume length mismatch. Expected $remaining bytes, got ${response.contentLength}.',
+      );
+    }
+  }
+
+  Future<void> _promoteVerifiedDownload(File part, File target) async {
+    final stat = await part.stat();
+    if (stat.type != FileSystemEntityType.file ||
+        !hasExactModelByteLength(stat.size)) {
+      throw const _PinnedModelIntegrityException(
+        'Verified model staging file is incomplete.',
+      );
+    }
+    if (await target.exists()) await target.delete();
+    await part.rename(target.path);
+  }
+
+  Future<void> _cancelResponse(HttpClientResponse response) async {
+    final subscription = response.listen((_) {});
+    await subscription.cancel();
+  }
+
+  void _setDownloadProgress(int received, String phase) {
+    final safeReceived = received.clamp(0, modelByteLength);
+    final progress = 5 + ((safeReceived / modelByteLength) * 48).floor();
+    final downloadedMiB = safeReceived ~/ (1024 * 1024);
+    final totalMiB = modelByteLength ~/ (1024 * 1024);
+    _setProgress(
+      progress.clamp(5, 53),
+      '$phase · $downloadedMiB / $totalMiB MiB',
+    );
   }
 
   Future<HttpClientResponse> _openPinnedGet(
     HttpClient client,
     Uri uri, {
+    required int offset,
     int redirects = 0,
   }) async {
     if (redirects > 5) throw StateError('Too many model redirects.');
@@ -798,6 +934,9 @@ final class ChessGemmaRuntime {
       HttpHeaders.userAgentHeader,
       'NexusChess/1 local-model',
     );
+    if (offset > 0) {
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
+    }
     final response = await request.close();
     if (response.isRedirect) {
       final location = response.headers.value(HttpHeaders.locationHeader);
@@ -808,10 +947,12 @@ final class ChessGemmaRuntime {
       return _openPinnedGet(
         client,
         uri.resolve(location),
+        offset: offset,
         redirects: redirects + 1,
       );
     }
-    if (response.statusCode != HttpStatus.ok) {
+    if (response.statusCode != HttpStatus.ok &&
+        response.statusCode != HttpStatus.partialContent) {
       await response.drain<void>();
       throw HttpException(
         'Pinned model host returned HTTP ${response.statusCode}.',
@@ -828,7 +969,9 @@ final class ChessGemmaRuntime {
   }
 
   void _setProgress(int progress, String phase) {
-    _progress = progress.clamp(0, 100);
+    final safeProgress = progress.clamp(0, 100);
+    if (_progress == safeProgress && _phase == phase) return;
+    _progress = safeProgress;
     _phase = phase;
     stdout.writeln('NEXUS_CHESS_LLM_PROGRESS $_progress $phase');
   }
@@ -839,6 +982,15 @@ final class _VerifiedModel {
 
   final File file;
   final String source;
+}
+
+final class _PinnedModelIntegrityException implements Exception {
+  const _PinnedModelIntegrityException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'Model verification failed: $message';
 }
 
 final class _DigestSink implements Sink<crypto.Digest> {

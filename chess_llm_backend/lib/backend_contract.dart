@@ -4,11 +4,13 @@ import 'dart:io';
 const schema = 'nexus.chess-llm/1';
 const service = 'nexus-chess-gemma';
 const modelName = 'gemma-4-E2B-it.litertlm';
+const modelRepository = 'litert-community/gemma-4-E2B-it-litert-lm';
+const modelRevision = '7fa1d78473894f7e736a21d920c3aa80f950c0db';
 const modelSha256 =
     'ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42';
 const modelByteLength = 2583085056;
 const modelUrl =
-    'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm';
+    'https://huggingface.co/$modelRepository/resolve/$modelRevision/$modelName';
 const modelPathVariable = 'NEXUS_CHESS_MODEL_PATH';
 const portVariable = 'NEXUS_CHESS_LLM_PORT';
 const tokenVariable = 'NEXUS_CHESS_LLM_TOKEN';
@@ -122,8 +124,30 @@ bool isAllowedModelUri(Uri uri) {
   final host = uri.host.toLowerCase();
   return host == 'huggingface.co' ||
       host.endsWith('.huggingface.co') ||
+      host == 'cdn.hf.co' ||
+      host.endsWith('.cdn.hf.co') ||
       host == 'xethub.hf.co' ||
       host.endsWith('.xethub.hf.co');
+}
+
+({int start, int end, int total})? parseContentRange(String? value) {
+  if (value == null) return null;
+  final match = RegExp(
+    r'^bytes ([0-9]+)-([0-9]+)/([0-9]+)$',
+  ).firstMatch(value.trim());
+  if (match == null) return null;
+  final start = int.tryParse(match.group(1)!);
+  final end = int.tryParse(match.group(2)!);
+  final total = int.tryParse(match.group(3)!);
+  if (start == null ||
+      end == null ||
+      total == null ||
+      start < 0 ||
+      end < start ||
+      total <= end) {
+    return null;
+  }
+  return (start: start, end: end, total: total);
 }
 
 String validatedPrompt(Map<String, dynamic> body) {

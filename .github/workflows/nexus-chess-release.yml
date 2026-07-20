@@ -190,7 +190,9 @@ jobs:
 
   linux:
     name: Linux x64 package
-    runs-on: ubuntu-24.04
+    # Build against glibc 2.35 so the sidecar runs on current Debian/Ubuntu,
+    # including systems older than the GitHub ubuntu-24.04 image.
+    runs-on: ubuntu-22.04
     needs: [preflight, godot_exports]
     steps:
       - uses: actions/checkout@v5
@@ -224,6 +226,29 @@ jobs:
           cp -a chess_llm_backend/build/linux/x64/release/bundle/. dist/package/linux/backend/
           test -s dist/package/linux/NexusChess.x86_64
           test -s dist/package/linux/backend/nexus_chess_llm
+          required_backend_files=(
+            data/icudtl.dat
+            data/flutter_assets/AssetManifest.bin
+            lib/libapp.so
+            lib/libflutter_linux_gtk.so
+            lib/libLiteRt.so
+            lib/libLiteRtLm.so
+            lib/libsqlite3.so
+          )
+          for backend_file in "${required_backend_files[@]}"; do
+            test -s "dist/package/linux/backend/${backend_file}"
+          done
+          if ldd dist/package/linux/backend/nexus_chess_llm | grep -q 'not found'; then
+            echo 'The packaged Flutter backend has unresolved shared libraries.'
+            ldd dist/package/linux/backend/nexus_chess_llm
+            exit 1
+          fi
+          newest_glibc=$(find dist/package/linux/backend -type f \( -name '*.so' -o -name 'nexus_chess_llm' \) -exec readelf --version-info {} + 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1)
+          if [ "$(printf '%s\n' "$newest_glibc" 'GLIBC_2.35' | sort -V | tail -1)" != 'GLIBC_2.35' ]; then
+            echo "Flutter backend requires ${newest_glibc}; expected no newer than GLIBC_2.35."
+            exit 1
+          fi
+          echo "Packaged Flutter backend ABI ceiling: ${newest_glibc}"
           chmod +x dist/package/linux/NexusChess.x86_64 dist/package/linux/backend/nexus_chess_llm
           tar -C dist/package/linux -czf dist/Nexus-Chess-Linux-x64.tar.gz .
 

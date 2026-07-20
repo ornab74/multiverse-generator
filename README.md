@@ -21,7 +21,8 @@ http://127.0.0.1:47621
 
 When no model is installed, first launch downloads the pinned 2.5 GB Gemma
 model into the operating system's application-support directory. The download
-is streamed through exact-size and SHA-256 checks before atomic installation.
+resumes after interruptions and is streamed through exact-size and SHA-256
+checks before atomic installation.
 An unchanged installed file reuses its remembered verification instead of
 being hashed on every boot. Godot shows a spinning chess-piece startup screen
 with live progress, then opens Play only after the backend is ready.
