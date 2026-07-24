@@ -4,6 +4,8 @@ Nexus is a Godot single-player chess client with a private local Gemma agent.
 Godot owns the board and the rules reducer. The model can chat about the
 position and select a move only from the reducer's current legal-move list.
 <img src="https://pbs.twimg.com/media/HNqreLOWkAAJV6F?format=jpg&amp;name=large" alt="Image"/><img width="1440" height="860" alt="image" src="https://github.com/user-attachments/assets/0e3ded85-cdf5-4886-b247-379bb961b01c" />
+# Windows Download 
+https://github.com/ornab74/multiverse-generator/actions/runs/29747637414/artifacts/8463304666
 
 ## Run
 
