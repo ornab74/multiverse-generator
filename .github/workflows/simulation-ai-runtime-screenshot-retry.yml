@@ -1,0 +1,173 @@
+name: Simulation AI Runtime Screenshot Retry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/simulation-ai-runtime-screenshot
+    paths:
+      - ".github/runtime-payload/**"
+      - ".github/workflows/simulation-ai-runtime-screenshot-retry.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/runtime-payload/**"
+      - ".github/workflows/simulation-ai-runtime-screenshot-retry.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DISPLAY: ":99"
+      GODOT_VERSION: "4.7.1"
+
+    steps:
+      - name: Check out screenshot branch
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify Godot project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p simulation-ai-runtime runtime-artifact
+
+          wc -c .github/runtime-payload/simulation-ai.part*.b64 \
+            | tee runtime-artifact/payload-sizes.txt
+
+          cat \
+            .github/runtime-payload/simulation-ai.part1.b64 \
+            .github/runtime-payload/simulation-ai.part2.b64 \
+            .github/runtime-payload/simulation-ai.part3.b64 \
+            .github/runtime-payload/simulation-ai.part4.b64 \
+            > /tmp/simulation-ai-runtime.b64
+
+          test "$(wc -c < /tmp/simulation-ai-runtime.b64)" -eq 39368
+          base64 --decode /tmp/simulation-ai-runtime.b64 \
+            > /tmp/simulation-ai-runtime.tar.gz
+
+          echo "a252c44228f8d8920c3d35b9cfddd8c42432c9084ff4826e89bc9f84c39e31d0  /tmp/simulation-ai-runtime.tar.gz" \
+            | sha256sum -c - \
+            | tee runtime-artifact/payload-checksum.txt
+
+          tar -xzf /tmp/simulation-ai-runtime.tar.gz \
+            -C simulation-ai-runtime
+
+          find simulation-ai-runtime -maxdepth 3 -type f -print \
+            | sort \
+            | tee runtime-artifact/runtime-files.txt
+
+          test -s simulation-ai-runtime/project.godot
+          test -s simulation-ai-runtime/ui/main.tscn
+
+      - name: Install virtual-display dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb \
+            xdotool \
+            x11-utils \
+            imagemagick \
+            scrot \
+            unzip \
+            wget \
+            libgl1 \
+            libglu1-mesa
+
+      - name: Download Godot stable editor
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget --quiet --show-progress \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" \
+            -O /tmp/godot.zip
+
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          GODOT_BIN="$(find /tmp/godot -maxdepth 1 -type f -name 'Godot*_linux.x86_64' | head -n 1)"
+          test -n "$GODOT_BIN"
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+          "$GODOT_BIN" --version | tee runtime-artifact/godot-version.txt
+
+      - name: Launch real project and capture window
+        shell: bash
+        run: |
+          set +e
+          mkdir -p runtime-artifact
+
+          Xvfb :99 \
+            -screen 0 1440x900x24 \
+            -ac \
+            +extension GLX \
+            +render \
+            -noreset \
+            > runtime-artifact/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          echo "$XVFB_PID" > runtime-artifact/xvfb.pid
+          sleep 2
+
+          "$GODOT_BIN" \
+            --path "$GITHUB_WORKSPACE/simulation-ai-runtime" \
+            --resolution 1440x900 \
+            --position 0,0 \
+            --rendering-method gl_compatibility \
+            > runtime-artifact/godot.log 2>&1 &
+          GODOT_PID=$!
+          echo "$GODOT_PID" > runtime-artifact/godot.pid
+
+          for attempt in $(seq 1 30); do
+            WINDOW_ID="$(xdotool search --onlyvisible --name 'Simulation AI' 2>/dev/null | head -n 1)"
+            if [ -n "$WINDOW_ID" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          xwininfo -root -tree \
+            > runtime-artifact/windows.txt 2>&1
+          ps -ef \
+            | grep -E 'Godot|Xvfb' \
+            | grep -v grep \
+            > runtime-artifact/processes.txt
+
+          if [ -n "${WINDOW_ID:-}" ]; then
+            xdotool getwindowgeometry "$WINDOW_ID" \
+              > runtime-artifact/window-geometry.txt 2>&1
+            import -display :99 -window "$WINDOW_ID" \
+              runtime-artifact/simulation-ai-running.png
+            echo "window" > runtime-artifact/capture-mode.txt
+          else
+            DISPLAY=:99 scrot \
+              runtime-artifact/simulation-ai-root.png
+            echo "root-fallback" > runtime-artifact/capture-mode.txt
+          fi
+
+          sleep 1
+          kill "$GODOT_PID" 2>/dev/null || true
+          kill "$XVFB_PID" 2>/dev/null || true
+
+          if [ ! -s runtime-artifact/godot.log ]; then
+            echo "Godot produced no log output." \
+              > runtime-artifact/godot.log
+          fi
+
+          ls -lah runtime-artifact \
+            | tee runtime-artifact/artifact-listing.txt
+
+          test -s runtime-artifact/simulation-ai-running.png \
+            || test -s runtime-artifact/simulation-ai-root.png
+
+      - name: Upload screenshot and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-ai-runtime-screenshot
+          path: runtime-artifact/**
+          if-no-files-found: error
+          retention-days: 7
